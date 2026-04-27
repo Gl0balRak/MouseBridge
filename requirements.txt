@@ -1,0 +1,3 @@
+pynput>=1.7.6
+zeroconf>=0.131
+PyQt5>=5.15
