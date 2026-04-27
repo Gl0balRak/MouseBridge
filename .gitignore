@@ -1,0 +1,29 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# IDE
+/.idea
+/.vscode
+*.iml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local config / secrets
+/local.toml
+/.env
+/.env.local
+*.pem
+*.key
+*.pfx
+*.p12
+
+# Build artifacts not committed
+/dist
+/release
+*.dmg
+*.msi
+*.exe.bak

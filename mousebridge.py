@@ -225,9 +225,8 @@ class Bridge:
         self.peer = addr
         self.peer_uuid = peer_uuid
         print(f"[mdns] peer found: {addr} uuid={peer_uuid[:8] if peer_uuid else '?'}")
-        if peer_uuid and self.cfg["uuid"] > peer_uuid:
-            print("[bootstrap] my uuid > peer uuid → yielding cursor")
-            self.go_captured()
+        # Step 1: sync mode. No bootstrap-yield. Both nodes keep their cursor
+        # visible and just mirror each other's input.
 
     # -------- сеть --------
 
@@ -262,32 +261,32 @@ class Bridge:
             self.handle_msg(msg)
 
     def handle_msg(self, msg):
+        # Step 1 (SYNC): always apply incoming events to local cursor,
+        # regardless of state.
         t = msg.get("type")
         if t == "Move":
-            if self.local:
-                cx, cy = cursor_pos()
-                nx = max(0, min(self.sw - 1, cx + msg["dx"]))
-                ny = max(0, min(self.sh - 1, cy + msg["dy"]))
-                warp_cursor(nx, ny)
+            cx, cy = cursor_pos()
+            nx = max(0, min(self.sw - 1, cx + msg["dx"]))
+            ny = max(0, min(self.sh - 1, cy + msg["dy"]))
+            warp_cursor(nx, ny)
+            # Sync last_x/y so the on_move echo from this warp computes dx=0
+            # and doesn't bounce back to peer.
+            self.last_x, self.last_y = nx, ny
         elif t == "Button":
-            if self.local:
-                btn_map = {1: mouse.Button.left, 2: mouse.Button.right, 3: mouse.Button.middle}
-                btn = btn_map.get(msg["button"])
-                if btn:
-                    if msg["pressed"]:
-                        self.mouse_ctrl.press(btn)
-                    else:
-                        self.mouse_ctrl.release(btn)
+            btn_map = {1: mouse.Button.left, 2: mouse.Button.right, 3: mouse.Button.middle}
+            btn = btn_map.get(msg["button"])
+            if btn:
+                if msg["pressed"]:
+                    self.mouse_ctrl.press(btn)
+                else:
+                    self.mouse_ctrl.release(btn)
         elif t == "Wheel":
-            if self.local:
-                self.mouse_ctrl.scroll(msg.get("dx", 0), msg.get("dy", 0))
+            self.mouse_ctrl.scroll(msg.get("dx", 0), msg.get("dy", 0))
         elif t == "Key":
-            if self.local:
-                self.inject_key(msg["key"], msg["pressed"])
-        elif t == "TakeOver":
-            self.go_local(edge=msg.get("edge", "left"))
+            self.inject_key(msg["key"], msg["pressed"])
         elif t == "Disconnect":
-            self.go_local(edge="center")
+            # Peer in panic; nothing to do for us in sync mode.
+            pass
 
     def inject_key(self, k, pressed):
         try:
@@ -329,36 +328,23 @@ class Bridge:
     # -------- локальные input handlers --------
 
     def on_mouse_move(self, x, y):
+        # Step 1: pure SYNC. Send every delta to peer; cursor stays visible
+        # locally and moves naturally too. peer applies the same delta to its
+        # own cursor. No state transitions, no recenter, no edge detection.
         if self.in_panic() or not self.peer:
-            return
-        if self.expect_recenter and abs(x - self.cx) < 2 and abs(y - self.cy) < 2:
-            self.expect_recenter = False
-            self.last_x, self.last_y = self.cx, self.cy
-            return
-
-        if self.local:
-            if x >= self.sw - 1:
-                print(f"[edge] right at ({x},{y}) → TakeOver(left)")
-                self.send({"type": "TakeOver", "edge": "left"})
-                self.go_captured()
-                return
-            if x <= 0:
-                print(f"[edge] left at ({x},{y}) → TakeOver(right)")
-                self.send({"type": "TakeOver", "edge": "right"})
-                self.go_captured()
-                return
             self.last_x, self.last_y = x, y
-        else:
-            dx = x - self.last_x
-            dy = y - self.last_y
-            if dx != 0 or dy != 0:
-                self.send({"type": "Move", "dx": int(dx), "dy": int(dy)})
-            self.expect_recenter = True
-            warp_cursor(self.cx, self.cy)
-            self.last_x, self.last_y = self.cx, self.cy
+            return
+        dx = x - self.last_x
+        dy = y - self.last_y
+        # Echo from our own warp_cursor (when peer Move arrives, we call warp,
+        # which fires on_move with pt == new pos; we already updated last_x/y
+        # in handle_msg to match, so dx=0 here and we send nothing).
+        self.last_x, self.last_y = x, y
+        if dx != 0 or dy != 0:
+            self.send({"type": "Move", "dx": int(dx), "dy": int(dy)})
 
     def on_mouse_click(self, x, y, button, pressed):
-        if self.in_panic() or self.local or not self.peer:
+        if self.in_panic() or not self.peer:
             return
         btn_map = {mouse.Button.left: 1, mouse.Button.right: 2, mouse.Button.middle: 3}
         b = btn_map.get(button)
@@ -366,7 +352,7 @@ class Bridge:
             self.send({"type": "Button", "button": b, "pressed": pressed})
 
     def on_mouse_scroll(self, x, y, dx, dy):
-        if self.in_panic() or self.local or not self.peer:
+        if self.in_panic() or not self.peer:
             return
         self.send({"type": "Wheel", "dx": int(dx), "dy": int(dy)})
 
@@ -379,7 +365,7 @@ class Bridge:
                 return
             self.last_esc_ms = now
 
-        if self.in_panic() or self.local or not self.peer:
+        if self.in_panic() or not self.peer:
             return
         try:
             k = key.char if hasattr(key, "char") and key.char else str(key)
@@ -388,7 +374,7 @@ class Bridge:
             pass
 
     def on_key_release(self, key):
-        if self.in_panic() or self.local or not self.peer:
+        if self.in_panic() or not self.peer:
             return
         try:
             k = key.char if hasattr(key, "char") and key.char else str(key)
@@ -465,11 +451,11 @@ class StatusWindow(QtWidgets.QWidget):
         if b.in_panic():
             self.status_lbl.setText(f"PANIC ({b.panic_seconds_left()}s)")
             self.status_lbl.setStyleSheet("color: #d97706;")
-        elif b.local:
-            self.status_lbl.setText("LOCAL — курсор здесь")
+        elif b.peer is None:
+            self.status_lbl.setText("LOCAL — peer не найден")
             self.status_lbl.setStyleSheet("color: #16a34a;")
         else:
-            self.status_lbl.setText("CAPTURED — курсор у peer'а")
+            self.status_lbl.setText("SYNC — оба курсора синхронизированы")
             self.status_lbl.setStyleSheet("color: #2563eb;")
 
         self.host_lbl.setText(
