@@ -1,29 +1,23 @@
-# Rust
-/target
-**/*.rs.bk
-Cargo.lock.bak
+# Per-node config (UUID, hostname). Each machine generates its own.
+mousebridge.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+*.egg
+.venv/
+venv/
+.python-version
 
 # IDE
-/.idea
-/.vscode
-*.iml
+.idea/
+.vscode/
 
 # OS
 .DS_Store
 Thumbs.db
 
-# Local config / secrets
-/local.toml
-/.env
-/.env.local
-*.pem
-*.key
-*.pfx
-*.p12
-
-# Build artifacts not committed
-/dist
-/release
-*.dmg
-*.msi
-*.exe.bak
+# Old Rust artifacts (left over from before the Python rewrite)
+target/
+Cargo.lock
