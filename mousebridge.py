@@ -131,10 +131,15 @@ class MdnsListener(ServiceListener):
                 peer_uuid = v.decode("utf-8", errors="ignore")
         if peer_uuid == self.bridge.cfg["uuid"]:
             return
-        addrs = info.parsed_addresses() if hasattr(info, "parsed_addresses") else []
+        all_addrs = info.parsed_addresses() if hasattr(info, "parsed_addresses") else []
+        # Prefer IPv4 over IPv6 link-local — the latter often isn't routable
+        # between Win and Mac without scoped addresses.
+        v4 = [a for a in all_addrs if ":" not in a]
+        addrs = v4 if v4 else all_addrs
         if not addrs:
             return
         peer_addr = (addrs[0], info.port or PORT)
+        print(f"[mdns] resolved {name} → {peer_addr}  (all: {all_addrs})")
         self.bridge.on_peer_found(peer_addr, peer_uuid)
 
     def remove_service(self, zc, type_, name):
