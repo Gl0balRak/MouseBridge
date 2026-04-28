@@ -132,15 +132,13 @@ class MdnsListener(ServiceListener):
         if peer_uuid == self.bridge.cfg["uuid"]:
             return
         all_addrs = info.parsed_addresses() if hasattr(info, "parsed_addresses") else []
-        # Prefer IPv4 over IPv6 link-local — the latter often isn't routable
-        # between Win and Mac without scoped addresses.
         v4 = [a for a in all_addrs if ":" not in a]
-        addrs = v4 if v4 else all_addrs
-        if not addrs:
+        if not v4:
             return
-        peer_addr = (addrs[0], info.port or PORT)
-        print(f"[mdns] resolved {name} → {peer_addr}  (all: {all_addrs})")
-        self.bridge.on_peer_found(peer_addr, peer_uuid)
+        port = info.port or PORT
+        peer_addrs = [(ip, port) for ip in v4]
+        print(f"[mdns] resolved {name} → {peer_addrs}")
+        self.bridge.on_peer_found(peer_addrs, peer_uuid)
 
     def remove_service(self, zc, type_, name):
         pass
@@ -163,7 +161,9 @@ class Bridge:
               f"uuid={self.cfg['uuid'][:8]} screen={self.sw}x{self.sh}")
 
         self.local = True
-        self.peer = None
+        self.peer = None              # primary (first in peer_addrs)
+        self.peer_addrs = []          # all candidate (ip, port) from mDNS
+        self.peer_confirmed = None    # source addr of last actually-received packet
         self.peer_uuid = None
         self.expect_recenter = False
         self.last_x, self.last_y = cursor_pos()
@@ -202,36 +202,51 @@ class Bridge:
     # -------- mDNS --------
 
     def register_mdns(self):
-        local_ip = self.detect_local_ip()
+        local_ips = self.detect_local_ips()
         info = ServiceInfo(
             SERVICE_TYPE,
             f"{self.cfg['uuid']}.{SERVICE_TYPE}",
-            addresses=[socket.inet_aton(local_ip)],
+            addresses=[socket.inet_aton(ip) for ip in local_ips],
             port=PORT,
             properties={"uuid": self.cfg["uuid"], "hostname": self.cfg["hostname"]},
             server=f"{self.cfg['hostname']}.local.",
         )
         self.zc.register_service(info)
-        print(f"[mdns] registered as {self.cfg['uuid'][:8]} on {local_ip}:{PORT}")
+        print(f"[mdns] registered as {self.cfg['uuid'][:8]} on {local_ips}:{PORT}")
 
-    def detect_local_ip(self):
+    def detect_local_ips(self):
+        ips = set()
+        # default-route IP (could be VPN tunnel; we still include it).
         try:
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             s.connect(("8.8.8.8", 80))
-            ip = s.getsockname()[0]
+            ips.add(s.getsockname()[0])
             s.close()
-            return ip
         except Exception:
-            return "127.0.0.1"
+            pass
+        # All addresses associated with the hostname.
+        try:
+            for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+                ips.add(info[4][0])
+        except Exception:
+            pass
+        # Filter out loopback / link-local. Keep everything else; we'll send
+        # to ALL of them on the receiver side and let the first one that
+        # actually routes win.
+        result = sorted(ip for ip in ips
+                        if not ip.startswith("127.")
+                        and not ip.startswith("169.254."))
+        return result or ["127.0.0.1"]
 
-    def on_peer_found(self, addr, peer_uuid):
-        if self.peer is not None:
+    def on_peer_found(self, addrs, peer_uuid):
+        # addrs: list of (ip, port). Sender will try each; rx_loop pins the
+        # first one that actually replies as self.peer_confirmed.
+        if self.peer_addrs:
             return
-        self.peer = addr
+        self.peer_addrs = list(addrs)
+        self.peer = addrs[0]
         self.peer_uuid = peer_uuid
-        print(f"[mdns] peer found: {addr} uuid={peer_uuid[:8] if peer_uuid else '?'}")
-        # Step 1: sync mode. No bootstrap-yield. Both nodes keep their cursor
-        # visible and just mirror each other's input.
+        print(f"[mdns] peer found: {addrs} uuid={peer_uuid[:8] if peer_uuid else '?'}")
 
     # -------- сеть --------
 
@@ -242,18 +257,27 @@ class Bridge:
         return max(0, int((self.panic_until - time.time() * 1000) / 1000))
 
     def send(self, msg):
-        if not self.peer or self.in_panic():
+        if self.in_panic():
             return
-        try:
-            self.sock.sendto(json.dumps(msg).encode("utf-8"), self.peer)
-            self.sent_count += 1
-        except Exception as e:
-            print(f"[send] error: {e}")
+        targets = []
+        if self.peer_confirmed:
+            targets = [self.peer_confirmed]
+        else:
+            targets = list(self.peer_addrs)
+        if not targets:
+            return
+        data = json.dumps(msg).encode("utf-8")
+        for t in targets:
+            try:
+                self.sock.sendto(data, t)
+            except Exception as e:
+                print(f"[send] {t}: {e}")
+        self.sent_count += 1
 
     def rx_loop(self):
         while True:
             try:
-                data, _addr = self.sock.recvfrom(4096)
+                data, addr = self.sock.recvfrom(4096)
             except Exception:
                 continue
             if self.in_panic():
@@ -262,6 +286,10 @@ class Bridge:
                 msg = json.loads(data.decode("utf-8"))
             except Exception:
                 continue
+            # Pin the actually-working source address for future sends.
+            if self.peer_confirmed != addr:
+                print(f"[rx] peer confirmed at {addr}")
+            self.peer_confirmed = addr
             self.recv_count += 1
             self.handle_msg(msg)
 
@@ -333,10 +361,7 @@ class Bridge:
     # -------- локальные input handlers --------
 
     def on_mouse_move(self, x, y):
-        # Step 1: pure SYNC. Send every delta to peer; cursor stays visible
-        # locally and moves naturally too. peer applies the same delta to its
-        # own cursor. No state transitions, no recenter, no edge detection.
-        if self.in_panic() or not self.peer:
+        if self.in_panic() or not self.peer_addrs:
             self.last_x, self.last_y = x, y
             return
         dx = x - self.last_x
@@ -349,7 +374,7 @@ class Bridge:
             self.send({"type": "Move", "dx": int(dx), "dy": int(dy)})
 
     def on_mouse_click(self, x, y, button, pressed):
-        if self.in_panic() or not self.peer:
+        if self.in_panic() or not self.peer_addrs:
             return
         btn_map = {mouse.Button.left: 1, mouse.Button.right: 2, mouse.Button.middle: 3}
         b = btn_map.get(button)
@@ -357,7 +382,7 @@ class Bridge:
             self.send({"type": "Button", "button": b, "pressed": pressed})
 
     def on_mouse_scroll(self, x, y, dx, dy):
-        if self.in_panic() or not self.peer:
+        if self.in_panic() or not self.peer_addrs:
             return
         self.send({"type": "Wheel", "dx": int(dx), "dy": int(dy)})
 
@@ -370,7 +395,7 @@ class Bridge:
                 return
             self.last_esc_ms = now
 
-        if self.in_panic() or not self.peer:
+        if self.in_panic() or not self.peer_addrs:
             return
         try:
             k = key.char if hasattr(key, "char") and key.char else str(key)
@@ -379,7 +404,7 @@ class Bridge:
             pass
 
     def on_key_release(self, key):
-        if self.in_panic() or not self.peer:
+        if self.in_panic() or not self.peer_addrs:
             return
         try:
             k = key.char if hasattr(key, "char") and key.char else str(key)
@@ -456,7 +481,7 @@ class StatusWindow(QtWidgets.QWidget):
         if b.in_panic():
             self.status_lbl.setText(f"PANIC ({b.panic_seconds_left()}s)")
             self.status_lbl.setStyleSheet("color: #d97706;")
-        elif b.peer is None:
+        elif not b.peer_addrs:
             self.status_lbl.setText("LOCAL — peer не найден")
             self.status_lbl.setStyleSheet("color: #16a34a;")
         else:
@@ -468,9 +493,11 @@ class StatusWindow(QtWidgets.QWidget):
             f"<code>uuid={b.cfg['uuid'][:8]}</code>  "
             f"screen={b.sw}×{b.sh}"
         )
-        if b.peer:
+        if b.peer_addrs:
             puuid = b.peer_uuid[:8] if b.peer_uuid else "?"
-            self.peer_lbl.setText(f"<b>Peer:</b> {b.peer[0]}:{b.peer[1]} <code>uuid={puuid}</code>")
+            confirmed = f"  ✓ {b.peer_confirmed[0]}" if b.peer_confirmed else "  (не подтверждён)"
+            addrs_str = ", ".join(f"{a[0]}" for a in b.peer_addrs)
+            self.peer_lbl.setText(f"<b>Peer</b> uuid={puuid}: {addrs_str}{confirmed}")
         else:
             self.peer_lbl.setText("<b>Peer:</b> идёт поиск через mDNS…")
 
@@ -491,6 +518,7 @@ def main():
 
     if args:
         ip = args[0]
+        bridge.peer_addrs = [(ip, PORT)]
         bridge.peer = (ip, PORT)
         print(f"[manual] peer = {bridge.peer}")
 
