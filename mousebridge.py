@@ -53,11 +53,11 @@ if IS_MAC:
         Quartz.CGWarpMouseCursorPosition((x, y))
 
     def hide_cursor():
-        Quartz.CGAssociateMouseAndMouseCursorPosition(False)
+        # Только визуально прячем — coupling не трогаем, чтобы pynput
+        # видел реальные координаты и считал deltas корректно.
         Quartz.CGDisplayHideCursor(Quartz.CGMainDisplayID())
 
     def show_cursor():
-        Quartz.CGAssociateMouseAndMouseCursorPosition(True)
         Quartz.CGDisplayShowCursor(Quartz.CGMainDisplayID())
 
 elif IS_WIN:
@@ -166,6 +166,11 @@ class Bridge:
         self.peer_confirmed = None    # source addr of last actually-received packet
         self.peer_uuid = None
         self.expect_recenter = False
+        # Secondary node = the one with the LEXICOGRAPHICALLY LARGER UUID.
+        # On secondary the cursor is hidden so we don't have two visible
+        # cursors fighting for attention. Input is still captured and sent.
+        self.secondary = False
+        self._cursor_hidden = False
         self.last_x, self.last_y = cursor_pos()
 
         self.last_esc_ms = 0
@@ -239,14 +244,13 @@ class Bridge:
         return result or ["127.0.0.1"]
 
     def on_peer_found(self, addrs, peer_uuid):
-        # addrs: list of (ip, port). Sender will try each; rx_loop pins the
-        # first one that actually replies as self.peer_confirmed.
         if self.peer_addrs:
             return
         self.peer_addrs = list(addrs)
         self.peer = addrs[0]
         self.peer_uuid = peer_uuid
         print(f"[mdns] peer found: {addrs} uuid={peer_uuid[:8] if peer_uuid else '?'}")
+        self.refresh_role()
 
     # -------- сеть --------
 
@@ -412,6 +416,30 @@ class Bridge:
         except Exception:
             pass
 
+    def refresh_role(self):
+        # Decide who's secondary based on UUIDs (deterministic).
+        if self.peer_uuid:
+            self.secondary = self.cfg["uuid"] > self.peer_uuid
+        else:
+            self.secondary = False
+        # Cursor is hidden ONLY when:
+        #   - we have a peer, and
+        #   - we are the secondary node, and
+        #   - we are not in panic (panic must give the user back their cursor).
+        want_hidden = (
+            self.secondary
+            and bool(self.peer_addrs)
+            and not self.in_panic()
+        )
+        if want_hidden and not self._cursor_hidden:
+            hide_cursor()
+            self._cursor_hidden = True
+            print("[role] secondary → cursor hidden")
+        elif not want_hidden and self._cursor_hidden:
+            show_cursor()
+            self._cursor_hidden = False
+            print("[role] cursor shown")
+
     def trigger_panic(self):
         print("[PANIC] двойной Esc → 30s disconnect")
         try:
@@ -420,6 +448,8 @@ class Bridge:
             pass
         self.panic_until = time.time() * 1000 + 30_000
         self.go_local(edge="center")
+        # Make the cursor visible right away regardless of role.
+        self.refresh_role()
 
 
 # ============================================================
@@ -478,14 +508,20 @@ class StatusWindow(QtWidgets.QWidget):
 
     def refresh(self):
         b = self.bridge
+        # Re-evaluate role / cursor visibility periodically so that when
+        # the panic timer expires we automatically re-hide if secondary.
+        b.refresh_role()
         if b.in_panic():
             self.status_lbl.setText(f"PANIC ({b.panic_seconds_left()}s)")
             self.status_lbl.setStyleSheet("color: #d97706;")
         elif not b.peer_addrs:
             self.status_lbl.setText("LOCAL — peer не найден")
             self.status_lbl.setStyleSheet("color: #16a34a;")
+        elif b.secondary:
+            self.status_lbl.setText("SYNC — secondary (курсор скрыт)")
+            self.status_lbl.setStyleSheet("color: #6b7280;")
         else:
-            self.status_lbl.setText("SYNC — оба курсора синхронизированы")
+            self.status_lbl.setText("SYNC — primary (курсор виден)")
             self.status_lbl.setStyleSheet("color: #2563eb;")
 
         self.host_lbl.setText(
