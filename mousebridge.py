@@ -79,15 +79,47 @@ elif IS_WIN:
     def warp_cursor(x, y):
         user32.SetCursorPos(int(x), int(y))
 
+    # Windows: ShowCursor(False) only affects the calling thread's cursor
+    # counter and only takes effect when that thread owns the foreground
+    # window. For *system-wide* cursor hiding we replace every system cursor
+    # (arrow, ibeam, hand, etc.) with a 32x32 fully-transparent cursor via
+    # SetSystemCursor. SystemParametersInfo(SPI_SETCURSORS) restores defaults.
+
+    _OCR_IDS = (
+        32512, 32513, 32514, 32515, 32516, 32631, 32640, 32641, 32642,
+        32643, 32644, 32645, 32646, 32648, 32649, 32650, 32651,
+    )
+    _SPI_SETCURSORS = 0x0057
+    _cursor_hidden_state = {"hidden": False, "blank": None}
+
+    def _make_blank_cursor():
+        # 32x32 monochrome cursor: AND mask = all 1s (transparent),
+        # XOR mask = all 0s (no draw). 32*32 bits = 128 bytes per mask.
+        and_mask = (ctypes.c_ubyte * 128)(*([0xFF] * 128))
+        xor_mask = (ctypes.c_ubyte * 128)(*([0x00] * 128))
+        return user32.CreateCursor(None, 0, 0, 32, 32,
+                                   ctypes.byref(and_mask),
+                                   ctypes.byref(xor_mask))
+
     def hide_cursor():
-        for _ in range(64):
-            if user32.ShowCursor(False) < 0:
-                break
+        if _cursor_hidden_state["hidden"]:
+            return
+        if _cursor_hidden_state["blank"] is None:
+            _cursor_hidden_state["blank"] = _make_blank_cursor()
+        blank = _cursor_hidden_state["blank"]
+        for cid in _OCR_IDS:
+            # SetSystemCursor takes ownership of the handle, so copy each time.
+            copied = user32.CopyIcon(blank)
+            if copied:
+                user32.SetSystemCursor(copied, cid)
+        _cursor_hidden_state["hidden"] = True
 
     def show_cursor():
-        for _ in range(64):
-            if user32.ShowCursor(True) >= 0:
-                break
+        if not _cursor_hidden_state["hidden"]:
+            return
+        # Restore default system cursors from registry.
+        user32.SystemParametersInfoW(_SPI_SETCURSORS, 0, None, 0)
+        _cursor_hidden_state["hidden"] = False
 
 else:
     raise RuntimeError("Поддерживаются только macOS и Windows")
