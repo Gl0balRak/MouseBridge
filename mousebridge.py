@@ -198,10 +198,12 @@ class Bridge:
         self.peer_confirmed = None    # source addr of last actually-received packet
         self.peer_uuid = None
         self.expect_recenter = False
-        # Secondary node = the one with the LEXICOGRAPHICALLY LARGER UUID.
-        # On secondary the cursor is hidden so we don't have two visible
-        # cursors fighting for attention. Input is still captured and sent.
+        # Secondary node = the one with the LEXICOGRAPHICALLY LARGER UUID,
+        # unless explicitly overridden via CLI flag or the GUI Swap button.
+        # On secondary the cursor is hidden + parked, primary owns the visible
+        # cursor.
         self.secondary = False
+        self.role_override = None     # None | "primary" | "secondary"
         self._cursor_hidden = False
         self.last_x, self.last_y = cursor_pos()
 
@@ -334,6 +336,11 @@ class Bridge:
         # receiver side too (defence in depth — if some old peer still sends).
         t = msg.get("type")
         if t == "Move":
+            # Only PRIMARY warps the visible cursor. Secondary's cursor is
+            # hidden + parked, it must not move when we receive packets,
+            # otherwise we get the "two cursors fighting" effect.
+            if self.secondary:
+                return
             cx, cy = cursor_pos()
             nx = max(0, min(self.sw - 1, cx + msg["dx"]))
             ny = max(0, min(self.sh - 1, cy + msg["dy"]))
@@ -382,15 +389,34 @@ class Bridge:
 
     # -------- локальные input handlers --------
 
+    # Park position for the secondary node. When the cursor on the secondary
+    # is hidden, we still need *some* on-screen position to read deltas from.
+    # We pin the cursor to PARK after every move so:
+    #   - it never reaches a screen edge (where mouse events stop)
+    #   - clicks on the secondary land on a predictable, unimportant spot
+    #   - dx/dy on the next physical move is computed from a known origin
+    PARK_X = 10
+    PARK_Y = 10
+
     def on_mouse_move(self, x, y):
         if self.in_panic() or not self.peer_addrs:
             self.last_x, self.last_y = x, y
             return
         dx = x - self.last_x
         dy = y - self.last_y
-        # Echo from our own warp_cursor (when peer Move arrives, we call warp,
-        # which fires on_move with pt == new pos; we already updated last_x/y
-        # in handle_msg to match, so dx=0 here and we send nothing).
+        if self.secondary:
+            # Secondary: send raw delta to primary, then re-park so we never
+            # drift to the screen edge. The warp itself triggers another
+            # on_move, but with dx,dy back to (PARK - x, PARK - y); we update
+            # last_x/y BEFORE the warp so that on_move sees dx=0,dy=0.
+            self.last_x, self.last_y = self.PARK_X, self.PARK_Y
+            if dx != 0 or dy != 0:
+                self.send({"type": "Move", "dx": int(dx), "dy": int(dy)})
+            warp_cursor(self.PARK_X, self.PARK_Y)
+            return
+        # Primary path: send delta if we moved (echo-suppressed because
+        # handle_msg syncs last_x/y to the warp target so synthetic moves
+        # produce dx=0).
         self.last_x, self.last_y = x, y
         if dx != 0 or dy != 0:
             self.send({"type": "Move", "dx": int(dx), "dy": int(dy)})
@@ -419,8 +445,13 @@ class Bridge:
         return
 
     def refresh_role(self):
-        # Decide who's secondary based on UUIDs (deterministic).
-        if self.peer_uuid:
+        # Manual override (CLI flag or GUI Swap button) wins over UUID order.
+        if self.role_override == "secondary":
+            self.secondary = True
+        elif self.role_override == "primary":
+            self.secondary = False
+        elif self.peer_uuid:
+            # Default: lexicographically larger UUID is secondary.
             self.secondary = self.cfg["uuid"] > self.peer_uuid
         else:
             self.secondary = False
@@ -441,6 +472,16 @@ class Bridge:
             show_cursor()
             self._cursor_hidden = False
             print("[role] cursor shown")
+
+    def swap_role(self):
+        """Toggle the manual role override. Called from the Swap button."""
+        # If currently secondary → force primary, and vice versa.
+        if self.secondary:
+            self.role_override = "primary"
+        else:
+            self.role_override = "secondary"
+        print(f"[role] manual override → {self.role_override}")
+        self.refresh_role()
 
     def trigger_panic(self):
         print("[PANIC] двойной Esc → 30s disconnect")
@@ -490,6 +531,10 @@ class StatusWindow(QtWidgets.QWidget):
         line2 = QtWidgets.QFrame()
         line2.setFrameShape(QtWidgets.QFrame.HLine)
         layout.addWidget(line2)
+
+        self.swap_btn = QtWidgets.QPushButton("Поменять роль (primary ↔ secondary)")
+        self.swap_btn.clicked.connect(lambda: self.bridge.swap_role())
+        layout.addWidget(self.swap_btn)
 
         hint = QtWidgets.QLabel(
             "<b>Управление:</b><br>"
@@ -550,9 +595,18 @@ class StatusWindow(QtWidgets.QWidget):
 
 def main():
     headless = "--no-gui" in sys.argv
+    force_primary = "--primary" in sys.argv
+    force_secondary = "--secondary" in sys.argv
     args = [a for a in sys.argv[1:] if not a.startswith("--")]
 
     bridge = Bridge()
+
+    if force_primary:
+        bridge.role_override = "primary"
+        print("[manual] role forced → primary")
+    elif force_secondary:
+        bridge.role_override = "secondary"
+        print("[manual] role forced → secondary")
 
     if args:
         ip = args[0]
