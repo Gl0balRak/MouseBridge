@@ -298,32 +298,18 @@ class Bridge:
             self.handle_msg(msg)
 
     def handle_msg(self, msg):
-        # Step 1 (SYNC): always apply incoming events to local cursor,
-        # regardless of state.
+        # Step 2: ONLY mouse-move sync. Click/wheel/key are dropped on the
+        # receiver side too (defence in depth — if some old peer still sends).
         t = msg.get("type")
         if t == "Move":
             cx, cy = cursor_pos()
             nx = max(0, min(self.sw - 1, cx + msg["dx"]))
             ny = max(0, min(self.sh - 1, cy + msg["dy"]))
             warp_cursor(nx, ny)
-            # Sync last_x/y so the on_move echo from this warp computes dx=0
-            # and doesn't bounce back to peer.
+            # Echo-suppression: keep last_x/last_y in sync with the warp so
+            # the on_move callback for this synthetic motion computes dx=0
+            # and doesn't bounce back.
             self.last_x, self.last_y = nx, ny
-        elif t == "Button":
-            btn_map = {1: mouse.Button.left, 2: mouse.Button.right, 3: mouse.Button.middle}
-            btn = btn_map.get(msg["button"])
-            if btn:
-                if msg["pressed"]:
-                    self.mouse_ctrl.press(btn)
-                else:
-                    self.mouse_ctrl.release(btn)
-        elif t == "Wheel":
-            self.mouse_ctrl.scroll(msg.get("dx", 0), msg.get("dy", 0))
-        elif t == "Key":
-            self.inject_key(msg["key"], msg["pressed"])
-        elif t == "Disconnect":
-            # Peer in panic; nothing to do for us in sync mode.
-            pass
 
     def inject_key(self, k, pressed):
         try:
@@ -378,19 +364,17 @@ class Bridge:
             self.send({"type": "Move", "dx": int(dx), "dy": int(dy)})
 
     def on_mouse_click(self, x, y, button, pressed):
-        if self.in_panic() or not self.peer_addrs:
-            return
-        btn_map = {mouse.Button.left: 1, mouse.Button.right: 2, mouse.Button.middle: 3}
-        b = btn_map.get(button)
-        if b:
-            self.send({"type": "Button", "button": b, "pressed": pressed})
+        # Step 2: clicks are NOT transmitted — they cause echo loops where
+        # Controller.press() generates a click that Listener captures and
+        # sends back. Only Move events are forwarded for now.
+        return
 
     def on_mouse_scroll(self, x, y, dx, dy):
-        if self.in_panic() or not self.peer_addrs:
-            return
-        self.send({"type": "Wheel", "dx": int(dx), "dy": int(dy)})
+        # Step 2: scroll not transmitted (same echo-loop risk).
+        return
 
     def on_key_press(self, key):
+        # Only PanicKey detection; key events are NOT forwarded.
         if key == keyboard.Key.esc:
             now = time.time() * 1000
             if now - self.last_esc_ms < 500:
@@ -399,22 +383,8 @@ class Bridge:
                 return
             self.last_esc_ms = now
 
-        if self.in_panic() or not self.peer_addrs:
-            return
-        try:
-            k = key.char if hasattr(key, "char") and key.char else str(key)
-            self.send({"type": "Key", "key": k, "pressed": True})
-        except Exception:
-            pass
-
     def on_key_release(self, key):
-        if self.in_panic() or not self.peer_addrs:
-            return
-        try:
-            k = key.char if hasattr(key, "char") and key.char else str(key)
-            self.send({"type": "Key", "key": k, "pressed": False})
-        except Exception:
-            pass
+        return
 
     def refresh_role(self):
         # Decide who's secondary based on UUIDs (deterministic).
